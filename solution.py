@@ -21,11 +21,23 @@ class SmartPlayer(Player):
         empty_cells = board.get_empty_cells()
         if not empty_cells:
             return (0, 0)
+
+        # Intentar bloquear amenazas críticas del rival
+        threat_blocks = find_threat_blocks(board, self.player_id)
+        if threat_blocks:
+            ordered_blocks = sorted(
+                threat_blocks,
+                key=lambda mv: -evaluate_block_move(board, mv, self.player_id)
+            )
+            return ordered_blocks[0]
+
+        # Si el tablero está vacío, jugar cerca del centro
         if len(empty_cells) == board.size * board.size:
             center = (board.size // 2, board.size // 2)
             if center in empty_cells:
                 return center
 
+        # MCTS normal con RAVE
         root = MCTSNode(board, player_to_move=self.player_id,
                         move=None, parent=None, root_player=self.player_id)
 
@@ -230,6 +242,7 @@ def heuristic_order(board: HexBoard, player_id: int) -> list[tuple]:
     """
     Ordena las casillas vacías por:
     - cercanía al centro,
+    - progreso en la dirección objetivo,
     - proximidad a grupos propios,
     - bloqueo potencial al rival.
     """
@@ -256,6 +269,12 @@ def heuristic_order(board: HexBoard, player_id: int) -> list[tuple]:
         d_center = abs(r - center_r) + abs(c - center_c)
         score = -d_center
 
+        # progreso en la dirección objetivo
+        if player_id == 1:  
+            score += 0.3 * c
+        else:
+            score += 0.3 * r
+
         # cercanía a piezas propias
         if my_cells:
             best_my = min(dist((r, c), m) for m in my_cells)
@@ -272,12 +291,61 @@ def heuristic_order(board: HexBoard, player_id: int) -> list[tuple]:
     return [mv for mv, _ in scored]
 
 
+def find_threat_blocks(board: HexBoard, defender_id: int) -> list[tuple]:
+    """
+    Devuelve casillas vacías que bloquean caminos cortos del rival.
+    defender_id: jugador que va a mover (id propio).
+    """
+    attacker = 3 - defender_id
+    empty = board.get_empty_cells()
+    if not empty:
+        return []
+
+    base_cost = estimate_connection_cost(board, attacker)
+
+    critical_moves = []
+    for (r, c) in empty:
+        tmp = board.clone()
+        tmp.place_piece(r, c, attacker)
+        new_cost = estimate_connection_cost(tmp, attacker)
+        # Si el atacante mejoraría mucho su conexión jugando ahí,
+        # entonces es una amenaza que conviene bloquear.
+        if new_cost < base_cost - 3:
+            critical_moves.append((r, c))
+
+    return critical_moves
+
+
+def evaluate_block_move(board: HexBoard, move: tuple, player_id: int) -> float:
+    """
+    Evalúa qué tan buena es una casilla de bloqueo:
+    - cuánto empeora el camino del rival,
+    - cuánto mejora el nuestro.
+    """
+    opp = 3 - player_id
+    r, c = move
+    tmp = board.clone()
+    tmp.place_piece(r, c, player_id)
+
+    opp_before = estimate_connection_cost(board, opp)
+    opp_after = estimate_connection_cost(tmp, opp)
+    my_before = estimate_connection_cost(board, player_id)
+    my_after = estimate_connection_cost(tmp, player_id)
+
+    delta_opp = opp_after - opp_before     # cuanto empeora su camino
+    delta_me = my_before - my_after        # cuanto mejora el mío
+
+    return 2.0 * delta_opp + 1.0 * delta_me
+
+
 # ===================== EVALUACIÓN HEURÍSTICA =====================
 
 def evaluate_board(board: HexBoard, player_id: int) -> float:
     """
     >0 favorece a player_id, <0 favorece al rival.
-    Basado en un costo de conexión aproximado (similar a camino mínimo).
+    Combina:
+    - costo de conexión (ofensivo/defensivo),
+    - control de camino propio (cantidad de fichas alineadas).
     """
     if board.check_connection(player_id):
         return 1e9
@@ -288,7 +356,44 @@ def evaluate_board(board: HexBoard, player_id: int) -> float:
     my_cost = estimate_connection_cost(board, player_id)
     opp_cost = estimate_connection_cost(board, opp)
 
-    return float(opp_cost - my_cost)
+    my_chain_score = path_influence_score(board, player_id)
+    opp_chain_score = path_influence_score(board, opp)
+
+    return (opp_cost - my_cost) + 0.5 * (my_chain_score - opp_chain_score)
+
+
+def path_influence_score(board: HexBoard, player_id: int) -> int:
+    """
+    Mide cuántas fichas propias están razonablemente cerca
+    de formar caminos.
+    """
+    n = board.size
+    score = 0
+    if player_id == 1:
+        # filas con continuidad aproximada izquierda-derecha
+        for r in range(n):
+            row_cells = [board.board[r][c] for c in range(n)]
+            run = 0
+            for v in row_cells:
+                if v == player_id:
+                    run += 1
+                    if run >= 2:
+                        score += run
+                else:
+                    run = 0
+    else:
+        # columnas con continuidad aproximada arriba-abajo
+        for c in range(n):
+            col_cells = [board.board[r][c] for r in range(n)]
+            run = 0
+            for v in col_cells:
+                if v == player_id:
+                    run += 1
+                    if run >= 2:
+                        score += run
+                else:
+                    run = 0
+    return score
 
 
 def estimate_connection_cost(board: HexBoard, player_id: int) -> int:
